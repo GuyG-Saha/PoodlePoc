@@ -13,7 +13,6 @@ class Attacker:
         target_byte_position: Position within that block (0-15)
         oracle_func: The server's padding oracle
         """
-        # Get the target block and the block before it
         block_start = target_block_index * BLOCK_SIZE
         target_block = self.original_ciphertext[block_start:block_start + BLOCK_SIZE]
         if target_block_index == 0:
@@ -62,14 +61,15 @@ class Attacker:
         self.original_ciphertext = original_ciphertext
         self.client_iv = iv
 
-        self._analyze_ciphertext()
+        self.analyze_ciphertext()
         # Start with the last block, last byte (this is where padding info is)
         num_blocks = len(original_ciphertext) // BLOCK_SIZE
         last_block_index = num_blocks - 1
         padding_byte = self.extract_byte(last_block_index, 15, oracle_func)
         print(f"Extracted padding byte: {padding_byte}")
+        return padding_byte
 
-    def _analyze_ciphertext(self):
+    def analyze_ciphertext(self):
         """Helper to understand the structure of intercepted ciphertext"""
         total_length = len(self.original_ciphertext)
         num_blocks = total_length // BLOCK_SIZE
