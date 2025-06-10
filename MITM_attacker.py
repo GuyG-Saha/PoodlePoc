@@ -42,12 +42,15 @@ class Attacker:
                 test_iv = self.client_iv
 
             # Query the oracle
-            if oracle_func(test_ciphertext, test_iv, None):
+            pad_flag, pad_byte = oracle_func(test_ciphertext, test_iv, None)
+            if pad_flag:
                 # Valid padding found! Now calculate the plaintext byte
                 # This is where the CBC math comes in...
                 # (The exact calculation depends on what padding value we're targeting)
-                print(f"INFO: MITM_attacker - Found valid padding with guess: {guess}")
-                return guess  # Simplified - you'll need the full math here
+                print(f"INFO: MITM_attacker - Found valid padding with guess: {guess}, pad byte: {pad_byte}")
+                intermediate_byte = guess ^ pad_byte
+                plaintext_byte = intermediate_byte ^ previous_block[target_byte_position]
+                return plaintext_byte  # After XORing
 
         return None  # Byte not found
 
@@ -58,18 +61,29 @@ class Attacker:
         #   Position it at the end of a block
         #   Extract using padding oracle
         # Assemble and return plaintext
+        extracted = []
         self.original_ciphertext = original_ciphertext
         self.client_iv = iv
 
-        self.analyze_ciphertext()
+        self._analyze_ciphertext()
         # Start with the last block, last byte (this is where padding info is)
         num_blocks = len(original_ciphertext) // BLOCK_SIZE
         last_block_index = num_blocks - 1
-        padding_byte = self.extract_byte(last_block_index, 15, oracle_func)
-        print(f"Extracted padding byte: {padding_byte}")
-        return padding_byte
+        padding_length_byte = self.extract_byte(last_block_index, 15, oracle_func)
+        if padding_length_byte > 15:
+            print('Padding byte not found!')
+        else:
+            print(f"INFO: MITM_attacker - Extracted the padding length byte! Plaintext: {padding_length_byte}")
 
-    def analyze_ciphertext(self):
+        # To be continued - doesn't work at the moment
+        for i in range(14, -1, -1):
+            extracted_byte = self.extract_byte(last_block_index, i, oracle_func)
+            if extracted_byte:
+                print(f"Extracted byte: {extracted_byte.to_bytes()}")
+                extracted.append(extracted_byte)
+        return extracted
+
+    def _analyze_ciphertext(self):
         """Helper to understand the structure of intercepted ciphertext"""
         total_length = len(self.original_ciphertext)
         num_blocks = total_length // BLOCK_SIZE

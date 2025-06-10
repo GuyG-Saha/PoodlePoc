@@ -20,7 +20,10 @@ class Client:
         return cipher_text, server_response
 
     def _cipher_plaintext(self):
-        plaintext = self.controllable_prefix + self.secret
+        if self.controllable_prefix:
+            plaintext = self.controllable_prefix + self.secret
+        else:
+            plaintext = self.secret
         padded_plaintext = self._ssl3_pad(plaintext, BLOCK_SIZE)
         cipher = AES.new(self.key, AES.MODE_CBC, self.IV)
         ciphered_text = cipher.encrypt(padded_plaintext)

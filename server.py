@@ -2,6 +2,7 @@ from Crypto.Cipher import AES
 
 from constants import *
 
+
 class Server:
     def __init__(self, client):
         self.client_iv = client.IV
@@ -26,10 +27,11 @@ class Server:
         try:
             cipher = AES.new(key, AES.MODE_CBC, iv)
             decrypted_data = cipher.decrypt(ciphertext)
-            return self.ssl3_validate_padding(decrypted_data, BLOCK_SIZE)
+            if self.ssl3_validate_padding(decrypted_data, BLOCK_SIZE):
+                return True, decrypted_data[-1]
         except ValueError as e:
             print(f'ERROR: Server padding_oracle output: {str(e)}')
-            return False
+        return False, -1
 
     def ssl3_validate_padding(self, padded_data, block_size) -> bool:
         """
@@ -45,6 +47,6 @@ class Server:
             return False
         # SSL v3 vulnerability: only checks the padding length byte
         # NOT checking the content of the other padding bytes
-        # In a proper implementation (like TLS), we would also verify all padding bytes
+        # In a proper implementation (like TLS), server would also verify all padding bytes
         # have the same value, but SSL v3 doesn't do this check
         return True
