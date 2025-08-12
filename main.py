@@ -6,9 +6,9 @@ from client import Client
 from MITM_attacker import Attacker
 
 if __name__ == '__main__':
-    secret = b"sessionid=secretvalue12345"
-    prefix = b"p"
-    ssl_v3_client = Client(secret, prefix)
+    secret = b"abcabcabc"
+    prefix = b""
+    ssl_v3_client = Client(secret, prefix, 'pcks7')
     mock_ssl_v3_server = Server(ssl_v3_client)
 
     # Initial client-server communication
