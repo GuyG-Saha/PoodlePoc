@@ -51,3 +51,15 @@ class Client:
             pad_len = block_size
         padding = bytes([pad_len] * pad_len)
         return data + padding
+
+    def encrypt_with_prefix_len(self, prefix_len):
+        """Encrypt the secret with a null-byte prefix of the given length.
+        Used by the POODLE attacker to position each secret byte at offset 15
+        of a block — the only position SSL3 padding validation covers."""
+        plaintext = b'\x00' * prefix_len + self.secret
+        if self.padding_style == 'x923':
+            padded = self._ssl3_pad_x923(plaintext, BLOCK_SIZE)
+        else:
+            padded = self._ssl3_pad_pcks7(plaintext, BLOCK_SIZE)
+        cipher = AES.new(self.key, AES.MODE_CBC, self.IV)
+        return cipher.encrypt(padded)
