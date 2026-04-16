@@ -2,95 +2,85 @@ from constants import *
 
 
 class Attacker:
-    def __init__(self, client_iv, ciphertext):
-        self.client_iv = client_iv
-        self.original_ciphertext = ciphertext
+    def __init__(self, client):
+        self.client = client
 
-    def extract_byte(self, target_block_index, target_byte_position, oracle_func):
+    def extract_byte(self, target_block, prev_block, oracle_func):
         """
-        Extract a single byte using padding oracle attack
-        target_block_index: Which block contains the byte we want
-        target_byte_position: Position within that block (0-15)
-        oracle_func: The server's padding oracle
-        """
-        block_start = target_block_index * BLOCK_SIZE
-        target_block = self.original_ciphertext[block_start:block_start + BLOCK_SIZE]
-        if target_block_index == 0:
-            # For first block, use IV as "previous block"
-            previous_block = bytearray(self.client_iv)
-        else:
-            # Use the actual previous ciphertext block
-            prev_start = (target_block_index - 1) * BLOCK_SIZE
-            previous_block = bytearray(self.original_ciphertext[prev_start:prev_start + BLOCK_SIZE])
+        Recover the plaintext byte at position 15 of target_block.
 
-        # Try different values for the byte in previous_block that affects our target byte
+        POODLE trick: SSL3 validates padding by checking ONLY the last byte
+        (must be 0-15). We try all 256 values for prev_block[15] and ask the
+        oracle whether the resulting decryption has valid padding.
+
+        CBC math:
+            decrypted[-1] = AES_decrypt(target_block)[-1] XOR modified_prev[15]
+                          = (plaintext[15] XOR original_prev[15]) XOR guess
+
+        Rearranging:
+            plaintext[15] = decrypted_last_byte XOR original_prev[15] XOR guess
+
+        The oracle returns the actual decrypted last byte on success, so the
+        formula gives an exact answer on the very first hit.
+        """
         for guess in range(256):
-            # Modify the previous block to test our guess
-            modified_previous = previous_block.copy()
-            modified_previous[target_byte_position] = guess
+            modified_prev = bytearray(prev_block)
+            modified_prev[15] = guess
 
-            # Create the ciphertext with our modification
-            if target_block_index == 0:
-                # Use modified IV
-                test_ciphertext = target_block
-                test_iv = bytes(modified_previous)
-            else:
-                # Replace the previous block in the ciphertext
-                test_ciphertext = (self.original_ciphertext[:prev_start] +
-                                   bytes(modified_previous) +
-                                   self.original_ciphertext[prev_start + BLOCK_SIZE:])
-                test_iv = self.client_iv
-
-            # Query the oracle
-            pad_flag, pad_byte = oracle_func(test_ciphertext, test_iv, None)
+            # Send the single target block with the modified previous block as IV
+            pad_flag, decrypted_last_byte = oracle_func(
+                bytes(target_block), bytes(modified_prev), None
+            )
             if pad_flag:
-                # Valid padding found! Now calculate the plaintext byte
-                # This is where the CBC math comes in...
-                # (The exact calculation depends on what padding value we're targeting)
-                print(f"INFO: MITM_attacker - Found valid padding with guess: {guess}, pad byte: {pad_byte}")
-                intermediate_byte = guess ^ pad_byte
-                plaintext_byte = intermediate_byte ^ previous_block[target_byte_position]
-                return plaintext_byte  # After XORing
+                plaintext_byte = decrypted_last_byte ^ prev_block[15] ^ guess
+                return plaintext_byte
 
-        return None  # Byte not found
+        return None  # should not happen for a correct oracle
 
-    def poodle_attack(self, original_ciphertext, iv, oracle_func):
-        """Full POODLE attack to extract secret"""
-        # Divide ciphertext into blocks
-        # For each byte in the secret:
-        #   Position it at the end of a block
-        #   Extract using padding oracle
-        # Assemble and return plaintext
-        extracted = []
-        self.original_ciphertext = original_ciphertext
-        self.client_iv = iv
+    def poodle_attack(self, oracle_func, secret_length):
+        """
+        Full POODLE attack: recover every byte of the secret one at a time.
 
-        self._analyze_ciphertext()
-        # Start with the last block, last byte (this is where padding info is)
-        num_blocks = len(original_ciphertext) // BLOCK_SIZE
-        last_block_index = num_blocks - 1
-        padding_length_byte = self.extract_byte(last_block_index, 15, oracle_func)
-        if padding_length_byte > 15:
-            print('Padding byte not found!')
-        else:
-            print(f"INFO: MITM_attacker - Extracted the padding length byte! Plaintext: {padding_length_byte}")
+        For each byte index i (0 .. secret_length-1):
+          1. Choose prefix_len = (15 - i) % 16 so that secret[i] lands at
+             position 15 of block 0 in the fresh encryption.
+          2. Request a fresh ciphertext from the client with that prefix.
+          3. Feed block 0 (and the IV as its "previous block") to extract_byte.
+          4. The oracle query modifies only IV[15] — the one byte that XORs
+             into plaintext position 15, which is the byte SSL3 validates.
+        """
+        extracted = bytearray(secret_length)
+        print(f"\n[POODLE] Starting attack — recovering {secret_length} byte(s)...")
 
-        # To be continued - doesn't work at the moment
-        for i in range(14, -1, -1):
-            extracted_byte = self.extract_byte(last_block_index, i, oracle_func)
-            if extracted_byte:
-                print(f"Extracted byte: {extracted_byte.to_bytes()}")
-                extracted.append(extracted_byte)
-        return extracted
+        for i in range(secret_length - 1, -1, -1):
+            # Position secret[i] at byte offset 15 inside block 0
+            prefix_len = (15 - i) % 16
 
-    def _analyze_ciphertext(self):
-        """Helper to understand the structure of intercepted ciphertext"""
-        total_length = len(self.original_ciphertext)
+            ciphertext = self.client.encrypt_with_prefix_len(prefix_len)
+
+            # Block 0 of this ciphertext has the target byte at position 15
+            target_block = ciphertext[:BLOCK_SIZE]
+            prev_block   = self.client.IV   # block 0's "previous" is the IV
+
+            byte_val = self.extract_byte(target_block, prev_block, oracle_func)
+
+            if byte_val is not None:
+                extracted[i] = byte_val
+                print(f"[POODLE] secret[{i}] = {chr(byte_val)!r}  (0x{byte_val:02x})")
+            else:
+                print(f"[POODLE] secret[{i}]: FAILED to recover")
+
+        result = bytes(extracted)
+        print(f"[POODLE] Recovered secret: {result}")
+        return result
+
+    def _analyze_ciphertext(self, ciphertext):
+        """Helper to display the block structure of an intercepted ciphertext."""
+        total_length = len(ciphertext)
         num_blocks = total_length // BLOCK_SIZE
         print(f"INFO: MITM_attacker - total ciphertext length: {total_length} bytes")
         print(f"INFO: MITM_attacker - Number of blocks: {num_blocks}")
         for i in range(num_blocks):
             start = i * BLOCK_SIZE
-            end = start + BLOCK_SIZE
-            block = self.original_ciphertext[start:end]
+            block = ciphertext[start:start + BLOCK_SIZE]
             print(f"INFO: MITM_attacker - Block {i}: {len(block)} bytes - {block.hex()}")
