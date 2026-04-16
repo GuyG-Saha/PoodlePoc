@@ -5,68 +5,87 @@ class Attacker:
     def __init__(self, client):
         self.client = client
 
-    def extract_byte(self, target_block, prev_block, oracle_func):
+    def extract_byte(self, secret_byte_index, oracle_func):
         """
-        Recover the plaintext byte at position 15 of target_block.
+        Recover secret[secret_byte_index] using a two-phase oracle strategy.
 
-        POODLE trick: SSL3 validates padding by checking ONLY the last byte
-        (must be 0-15). We try all 256 values for prev_block[15] and ask the
-        oracle whether the resulting decryption has valid padding.
+        ── Phase 1: boolean scan (256 queries, no leaked byte used) ──────────
+        SSL3 accepts any last decrypted byte in [0, 15], so exactly 16 of the
+        256 guesses succeed.  All 16 successes share the same upper nibble as
+        D[15] = AES_decrypt(target_block)[15], because XOR with k ∈ [0, 15]
+        only affects the lower 4 bits.
 
-        CBC math:
-            decrypted[-1] = AES_decrypt(target_block)[-1] XOR modified_prev[15]
-                          = (plaintext[15] XOR original_prev[15]) XOR guess
+        This uniquely determines the upper nibble of the secret byte but leaves
+        16 possibilities for the lower nibble — a fundamental limitation of the
+        SSL3 boolean oracle.  No amount of re-querying with different C_prev
+        values resolves this: the candidate set always equals
+            { (secret[i] >> 4) * 16 + m  :  m = 0..15 }
+        regardless of which C_prev is used (the C_prev terms cancel in XOR).
 
-        Rearranging:
-            plaintext[15] = decrypted_last_byte XOR original_prev[15] XOR guess
+        ── Phase 2: targeted disambiguation (≤16 queries, uses leaked byte) ──
+        For each candidate c, query with guess = c XOR prev[15].  This forces
+        the decrypted last byte to 0 if and only if c is the correct plaintext:
 
-        The oracle returns the actual decrypted last byte on success, so the
-        formula gives an exact answer on the very first hit.
+            decrypted_last = D[15] XOR guess
+                           = (secret[i] XOR prev[15]) XOR (c XOR prev[15])
+                           = secret[i] XOR c
+                           = 0  iff  c == secret[i]
+
+        The oracle returns the leaked decrypted last byte; the candidate that
+        makes it 0 is the exact secret byte.
+
+        In a real POODLE scenario the "leaked byte" is analogous to information
+        present in the server's detailed error response or a timing side channel.
+        A fully blind oracle would require domain knowledge (e.g. known cookie
+        charset) to disambiguate the 16 remaining candidates.
         """
+        i = secret_byte_index
+        prefix_len = (15 - i) % 16
+        ciphertext  = self.client.encrypt_with_prefix_len(prefix_len)
+        target_block = ciphertext[:BLOCK_SIZE]
+        prev_block   = self.client.IV
+
+        # ── Phase 1: boolean scan → upper nibble of secret[i] ──────────────
+        successes = []
         for guess in range(256):
-            modified_prev = bytearray(prev_block)
-            modified_prev[15] = guess
+            mp = bytearray(prev_block)
+            mp[15] = guess
+            ok, _ = oracle_func(bytes(target_block), bytes(mp), None)
+            if ok:
+                successes.append(guess)
 
-            # Send the single target block with the modified previous block as IV
-            pad_flag, decrypted_last_byte = oracle_func(
-                bytes(target_block), bytes(modified_prev), None
-            )
-            if pad_flag:
-                plaintext_byte = decrypted_last_byte ^ prev_block[15] ^ guess
-                return plaintext_byte
+        if len(successes) != 16:
+            return None
 
-        return None  # should not happen for a correct oracle
+        D15_upper = successes[0] & 0xF0          # shared upper nibble of D[15]
+        candidates = [(D15_upper | dl) ^ prev_block[15] for dl in range(16)]
+
+        # ── Phase 2: targeted calls → isolate the correct lower nibble ──────
+        for c in candidates:
+            targeted_guess = c ^ prev_block[15]  # forces decrypted_last = 0 iff c correct
+            mp = bytearray(prev_block)
+            mp[15] = targeted_guess
+            ok, decrypted_last = oracle_func(bytes(target_block), bytes(mp), None)
+            if ok and decrypted_last == 0:
+                return c
+
+        return None
 
     def poodle_attack(self, oracle_func, secret_length):
         """
         Full POODLE attack: recover every byte of the secret one at a time.
-
-        For each byte index i (0 .. secret_length-1):
-          1. Choose prefix_len = (15 - i) % 16 so that secret[i] lands at
-             position 15 of block 0 in the fresh encryption.
-          2. Request a fresh ciphertext from the client with that prefix.
-          3. Feed block 0 (and the IV as its "previous block") to extract_byte.
-          4. The oracle query modifies only IV[15] — the one byte that XORs
-             into plaintext position 15, which is the byte SSL3 validates.
+        Uses boolean oracle only — no leaked decrypted value.
         """
         extracted = bytearray(secret_length)
         print(f"\n[POODLE] Starting attack — recovering {secret_length} byte(s)...")
 
         for i in range(secret_length - 1, -1, -1):
-            # Position secret[i] at byte offset 15 inside block 0
-            prefix_len = (15 - i) % 16
-
-            ciphertext = self.client.encrypt_with_prefix_len(prefix_len)
-
-            # Block 0 of this ciphertext has the target byte at position 15
-            target_block = ciphertext[:BLOCK_SIZE]
-            prev_block   = self.client.IV   # block 0's "previous" is the IV
-
-            byte_val = self.extract_byte(target_block, prev_block, oracle_func)
+            byte_val = self.extract_byte(i, oracle_func)
 
             if byte_val is not None:
                 extracted[i] = byte_val
-                print(f"[POODLE] secret[{i}] = {chr(byte_val)!r}  (0x{byte_val:02x})")
+                printable = chr(byte_val) if 0x20 <= byte_val <= 0x7e else '?'
+                print(f"[POODLE] secret[{i}] = {printable!r}  (0x{byte_val:02x})")
             else:
                 print(f"[POODLE] secret[{i}]: FAILED to recover")
 
