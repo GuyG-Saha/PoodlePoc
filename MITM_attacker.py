@@ -30,13 +30,15 @@ class Attacker:
     def extract_byte(self, i, oracle_func):
         """Recover secret[i] exactly, using only the accept/reject oracle.
 
-        Framing: choose prefix_len so secret[i] sits at offset 15 of ciphertext
-        block 0, and suffix_len so the record is block-aligned. The record then
-        looks like:  [ data blocks ... ][ MAC block ][ full padding block ].
+        Framing: choose prefix_len so secret[i] sits at offset 15 of some
+        ciphertext block b, and suffix_len so the record is block-aligned. The
+        record then looks like:  [ data blocks ... ][ MAC block ][ full padding
+        block ]. The target byte may live in any data block, so secrets longer
+        than one block work exactly the same way.
 
         Each attempt (with a fresh IV, so every block is randomised):
-          1. Capture the ciphertext. C_target = block 0 holds secret[i] at
-             offset 15; its CBC predecessor is the IV.
+          1. Capture the ciphertext. C_target = block b holds secret[i] at
+             offset 15; its CBC predecessor is C_{b-1} (the IV when b == 0).
           2. Forge a record by replacing the final padding block with C_target.
              The block now in front of C_target is the MAC block, C_mac.
           3. Ask the oracle. The server decrypts the last block as
@@ -47,9 +49,9 @@ class Attacker:
         On acceptance:
              AES_decrypt(C_target)[15] XOR C_mac[15] == 15
           => AES_decrypt(C_target)[15] == 15 XOR C_mac[15]
-        and from the original (un-forged) chaining of block 0:
-             secret[i] == AES_decrypt(C_target)[15] XOR IV[15]
-          => secret[i] == 15 XOR C_mac[15] XOR IV[15]
+        and from the original (un-forged) chaining of block b:
+             secret[i] == AES_decrypt(C_target)[15] XOR C_{b-1}[15]
+          => secret[i] == 15 XOR C_mac[15] XOR C_{b-1}[15]
         Every term on the right is known from the captured ciphertext, so the
         byte is recovered exactly. Acceptance is a 1-in-256 event, so each byte
         costs ~256 oracle requests on average.
@@ -57,19 +59,20 @@ class Attacker:
         secret_len = len(self.client.secret)
         prefix_len = (BLOCK_SIZE - 1 - i) % BLOCK_SIZE
         suffix_len = (-(prefix_len + secret_len)) % BLOCK_SIZE  # keep record block-aligned
+        b = (prefix_len + i) // BLOCK_SIZE  # ciphertext block holding secret[i] at offset 15
 
         for attempt in range(1, self.MAX_ATTEMPTS_PER_BYTE + 1):
             iv, ct = self.client.attack_request(prefix_len, suffix_len)
-            blocks = self._blocks(iv, ct)
+            blocks = self._blocks(iv, ct)   # blocks[0] = IV, blocks[n+1] = C_n
 
-            c_target = blocks[1]        # C0: secret[i] at offset 15
-            iv_block = blocks[0]        # CBC predecessor of C0 in the real record
+            c_target = blocks[b + 1]    # C_b: secret[i] at offset 15
+            predecessor = blocks[b]     # CBC predecessor of C_b (the IV when b == 0)
             c_mac = blocks[-2]          # block in front of the padding block
 
             forged = ct[:-BLOCK_SIZE] + c_target
             if oracle_func(iv, forged):
                 d15 = (BLOCK_SIZE - 1) ^ c_mac[15]
-                return d15 ^ iv_block[15], attempt
+                return d15 ^ predecessor[15], attempt
 
         return None, self.MAX_ATTEMPTS_PER_BYTE
 
