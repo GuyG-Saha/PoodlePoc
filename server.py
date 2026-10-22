@@ -1,52 +1,61 @@
+import hashlib
+import hmac
+
 from Crypto.Cipher import AES
 
 from constants import *
 
 
 class Server:
+    """Emulates an SSL 3.0 server's record layer.
+
+    It decrypts a CBC record, strips padding *the SSL3 way* — trusting only the
+    final length byte and NOT inspecting the other padding bytes — then verifies
+    the MAC. It returns only a single bit: accept or reject. No decrypted
+    plaintext ever leaves the server, so there is nothing to leak.
+    """
+
     def __init__(self, client):
-        self.client_iv = client.IV
+        # Symmetric secrets shared with the client (as after a handshake).
         self.key = client.key
+        self.mac_key = client.mac_key
 
-    def process_request(self, ciphertext):
-        """Simulates processing an encrypted request"""
-        if self.padding_oracle(ciphertext, self.client_iv, self.key):
+    def process_request(self, iv, ciphertext):
+        if self._decrypt_and_verify(iv, ciphertext):
             return {"Code": 200, "Message": "Request processed successfully"}
-        else:
-            return {"Code": 400, "Message": "Bad request - invalid data"}
+        return {"Code": 400, "Message": "Bad request - invalid data"}
 
-    def padding_oracle(self, ciphertext, iv, key):
-        """
-        Complete padding oracle function that:
-        1. Decrypts the ciphertext
-        2. Validates the padding
-        3. Returns only whether padding is valid
-        This simulates the server's behavior in the POODLE attack scenario.
-        """
-        key = self.key if key is None else key
-        try:
-            cipher = AES.new(key, AES.MODE_CBC, iv)
-            decrypted_data = cipher.decrypt(ciphertext)
-            if self.ssl3_validate_padding(decrypted_data, BLOCK_SIZE):
-                return True, decrypted_data[-1]
-        except ValueError as e:
-            print(f'ERROR: Server padding_oracle output: {str(e)}')
-        return False, -1
+    def padding_oracle(self, iv, ciphertext):
+        """The only thing the attacker can observe: one accept/reject bit."""
+        return self._decrypt_and_verify(iv, ciphertext)
 
-    def ssl3_validate_padding(self, padded_data, block_size) -> bool:
-        """
-        SSL v3 vulnerable padding validation - only checks the last byte
-        Returns True if padding is valid, False otherwise
-        """
-        if len(padded_data) == 0 or len(padded_data) % block_size != 0:
+    def _decrypt_and_verify(self, iv, ciphertext):
+        if len(ciphertext) == 0 or len(ciphertext) % BLOCK_SIZE != 0:
             return False
-        pad_length = padded_data[-1]
-        if pad_length >= block_size:
+
+        plaintext = AES.new(self.key, AES.MODE_CBC, iv).decrypt(ciphertext)
+
+        # --- SSL3 padding removal (the vulnerable part) ---
+        pad_len = plaintext[-1]          # trust the length byte...
+        if pad_len >= BLOCK_SIZE:
             return False
-        if pad_length + 1 > len(padded_data):
+        strip = pad_len + 1
+        if strip > len(plaintext):
             return False
-        # SSL v3 vulnerability: only checks the padding length byte
-        # NOT checking the content of the other padding bytes
-        # In a proper implementation (like TLS), server would also verify all padding bytes
-        # have the same value, but SSL v3 doesn't do this check
-        return True
+        # ...and DO NOT check the content of the other padding bytes. A proper
+        # TLS implementation verifies every padding byte here; SSL3 does not,
+        # which is exactly what POODLE relies on.
+        body = plaintext[:-strip]
+
+        # --- MAC verification (what makes this a 1-in-256 oracle) ---
+        if len(body) < MAC_LEN:
+            return False
+        data, mac = body[:-MAC_LEN], body[-MAC_LEN:]
+        expected = hmac.new(self.mac_key, data, hashlib.sha256).digest()[:MAC_LEN]
+
+        # When an attacker swaps in a chosen block as the final block, the
+        # record only leaves data||MAC intact (and so verifies) if the decrypted
+        # last byte happens to be BLOCK_SIZE-1 — i.e. the whole final block is
+        # taken as padding. That is a 1-in-256 event, and it reveals nothing
+        # beyond "it happened".
+        return hmac.compare_digest(mac, expected)

